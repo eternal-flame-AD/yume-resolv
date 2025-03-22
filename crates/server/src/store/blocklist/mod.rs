@@ -15,6 +15,8 @@ pub use self::authority::BlocklistAuthority;
 use serde::Deserialize;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+type BlockListHasher = siphasher::sip128::SipHasher13;
+
 /// Consult action enum.  Controls how consult lookups are handled.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 pub enum BlocklistConsultAction {

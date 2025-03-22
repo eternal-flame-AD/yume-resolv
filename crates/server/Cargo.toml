@@ -36,7 +36,7 @@ backtrace = ["hickory-proto/backtrace"]
 recursor = ["dep:hickory-recursor", "dep:hickory-resolver"]
 resolver = ["dep:hickory-resolver"]
 sqlite = ["rusqlite"]
-blocklist = ["resolver"]
+blocklist = ["resolver", "dep:siphasher"]
 toml = ["dep:toml"]
 
 tls-aws-lc-rs = [
@@ -131,6 +131,7 @@ tokio-util.workspace = true
 hickory-proto = { workspace = true, features = ["serde", "text-parsing", "tokio"] }
 hickory-recursor = { workspace = true, features = ["serde"], optional = true }
 hickory-resolver = { workspace = true, features = ["serde", "system-config", "tokio"], optional = true }
+siphasher = { version = "1", optional = true }
 
 [dev-dependencies]
 futures-executor = { workspace = true, default-features = false, features = ["std"] }

@@ -5,17 +5,19 @@
 // https://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
+use siphasher::sip128::{Hash128, Hasher128};
 use std::{
-    collections::HashMap,
+    collections::HashSet,
     fs::File,
-    io,
-    io::{Error, Read},
+    hash::{BuildHasher, Hash, Hasher},
+    io::{self, Error, Read},
     net::{Ipv4Addr, Ipv6Addr},
+    ops::{Deref, DerefMut},
     path::Path,
     str::FromStr,
     time::{Duration, Instant},
 };
-use tracing::{error, info, trace};
+use tracing::{error, info, trace, warn};
 
 #[cfg(feature = "__dnssec")]
 use crate::{authority::Nsec3QueryInfo, dnssec::NxProofKind};
@@ -36,6 +38,8 @@ use crate::{
     store::blocklist::{BlocklistConfig, BlocklistConsultAction},
 };
 
+use super::BlockListHasher;
+
 // TODO:
 //  * Add (optional) support for logging the client IP address.  This will require some Authority
 //    trait changes to accomplish
@@ -44,6 +48,70 @@ use crate::{
 //  * Add support for an exclusion list: allow the user to configure a list of patterns that
 //    will never be insert into the in-memory blocklist (such as their own domain)
 //  * Add support for regex matching
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Hash128Output(u64, u64);
+
+impl From<Hash128> for Hash128Output {
+    fn from(hash: Hash128) -> Self {
+        let (a, b) = hash.as_u64();
+        Self(a, b)
+    }
+}
+
+impl Hash for Hash128Output {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.0);
+        state.write_u64(self.1);
+    }
+}
+
+impl Hash128Output {
+    fn add_wildcard_offset(self) -> Self {
+        Self(self.0, self.1.wrapping_add(1))
+    }
+}
+
+struct NoHashState;
+
+/// A hasher that simply rolls over the bytes, useful for if the input is already fully hashed
+struct NoHashHasher {
+    sum: u64,
+}
+
+impl Hasher for NoHashHasher {
+    fn finish(&self) -> u64 {
+        self.sum
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        self.sum = bytes.iter().fold(0, |sum, b| sum << 8 | *b as u64);
+    }
+
+    fn write_u64(&mut self, i: u64) {
+        self.sum ^= i;
+    }
+
+    fn write_u128(&mut self, i: u128) {
+        self.sum ^= i as u64;
+    }
+
+    fn write_i64(&mut self, i: i64) {
+        self.sum ^= i as u64;
+    }
+
+    fn write_i128(&mut self, i: i128) {
+        self.sum ^= i as u64;
+    }
+}
+
+impl BuildHasher for NoHashState {
+    type Hasher = NoHashHasher;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        NoHashHasher { sum: 0 }
+    }
+}
 
 /// A conditional authority that will resolve queries against one or more block lists and return a
 /// forged response.  The typical use case will be to use this in a chained configuration before a
@@ -60,8 +128,9 @@ use crate::{
 /// to do so - it is both more efficient, and more secure, to allow the blocklist to drop queries
 /// pre-emptively, as in the first example.
 pub struct BlocklistAuthority {
+    sip_base: BlockListHasher,
     origin: LowerName,
-    blocklist: HashMap<LowerName, bool>,
+    blocklist: HashSet<Hash128Output, NoHashState>,
     wildcard_match: bool,
     min_wildcard_depth: u8,
     sinkhole_ipv4: Ipv4Addr,
@@ -81,9 +150,17 @@ impl BlocklistAuthority {
     ) -> Result<Self, String> {
         info!("loading blocklist config: {origin}");
 
+        let rs0 = std::hash::RandomState::new();
+        let key0 = rs0.hash_one(0x1);
+        let rs1 = std::hash::RandomState::new();
+        let key1 = rs1.hash_one(0x2);
+
+        let hasher = BlockListHasher::new_with_keys(key0, key1);
+
         let mut authority = Self {
+            sip_base: hasher,
             origin: origin.into(),
-            blocklist: HashMap::new(),
+            blocklist: HashSet::with_hasher(NoHashState),
             wildcard_match: config.wildcard_match,
             min_wildcard_depth: config.min_wildcard_depth,
             sinkhole_ipv4: match config.sinkhole_ipv4 {
@@ -129,6 +206,37 @@ impl BlocklistAuthority {
         }
 
         Ok(authority)
+    }
+
+    fn segment_hashes<'a>(&self, name: &'a LowerName) -> impl Iterator<Item = Hash128Output> + 'a {
+        struct PreventClone<T>(T);
+        impl<T> Deref for PreventClone<T> {
+            type Target = T;
+
+            fn deref(&self) -> &Self::Target {
+                &self.0
+            }
+        }
+        impl<T> DerefMut for PreventClone<T> {
+            fn deref_mut(&mut self) -> &mut Self::Target {
+                &mut self.0
+            }
+        }
+        let mut hasher = PreventClone(self.sip_base.clone());
+
+        name.iter().rev().map(move |s| {
+            hasher.write(s);
+            let res = hasher.finish128().into();
+            res
+        })
+    }
+
+    fn final_segment_hash(&self, name: &LowerName) -> Hash128Output {
+        let mut hasher = self.sip_base.clone();
+        name.iter().rev().for_each(|s| {
+            hasher.write(s);
+        });
+        hasher.finish128().into()
     }
 
     /// Add the contents of a block list to the in-memory cache. This function is normally called
@@ -227,6 +335,20 @@ impl BlocklistAuthority {
                 str_entry += ".";
             }
 
+            let is_wildcard = match str_entry.strip_prefix("*.") {
+                Some(_) if !self.wildcard_match => {
+                    warn!("wildcard match is disabled, skipping blocklist entry {str_entry}");
+                    continue;
+                }
+                Some(trimmed) => {
+                    str_entry = trimmed.to_string();
+                    true
+                }
+                _ => false,
+            };
+
+            trace!("inserting blocklist entry {str_entry} (is_wildcard: {is_wildcard})");
+
             let Ok(name) = LowerName::from_str(&str_entry[..]) else {
                 error!(
                     "unable to derive LowerName for blocklist entry '{str_entry}'; skipping entry"
@@ -234,49 +356,46 @@ impl BlocklistAuthority {
                 continue;
             };
 
-            trace!("inserting blocklist entry {str_entry}");
+            let hash = self.final_segment_hash(&name);
 
-            // The boolean value is not significant; only the key is used.
-            self.blocklist.insert(name, true);
+            if is_wildcard {
+                let depth = name.iter().count();
+                if depth < self.min_wildcard_depth as usize {
+                    warn!(
+                        "wildcard depth is less than min_wildcard_depth, skipping blocklist entry {str_entry}"
+                    );
+                    continue;
+                }
+
+                self.blocklist.insert(hash.add_wildcard_offset());
+            } else {
+                self.blocklist.insert(hash);
+            }
         }
 
         Ok(())
     }
 
-    /// Build a wildcard match list for a given host
-    fn wildcards(&self, host: &Name) -> Vec<LowerName> {
-        host.iter()
-            .enumerate()
-            .filter_map(|(i, _x)| {
-                if i > ((self.min_wildcard_depth - 1) as usize) {
-                    Some(host.trim_to(i + 1).into_wildcard().into())
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
     /// Perform a blocklist lookup. Returns true on match, false on no match.  This is also where
     /// wildcard expansion is done, if wildcard support is enabled for the blocklist authority.
     fn is_blocked(&self, name: &LowerName) -> bool {
-        let mut match_list = vec![name.to_owned()];
-
-        if self.wildcard_match {
-            match_list.append(&mut self.wildcards(name));
+        if !self.wildcard_match {
+            return self.blocklist.contains(&self.final_segment_hash(&name));
         }
 
-        trace!("blocklist match list: {match_list:?}");
-
-        if match_list
-            .iter()
-            .any(|entry| self.blocklist.contains_key(entry))
-        {
-            info!("block list matched query {name}");
-            return true;
+        let mut last_hash = None;
+        for hash in self.segment_hashes(&name) {
+            if let Some(last_hash) = last_hash.replace(hash) {
+                if self.blocklist.contains(&last_hash.add_wildcard_offset()) {
+                    return true;
+                }
+            }
         }
-
-        false
+        if let Some(last_hash) = last_hash {
+            self.blocklist.contains(&last_hash)
+        } else {
+            false
+        }
     }
 
     /// Generate a BlocklistLookup to return on a blocklist match.  This will return a lookup with
