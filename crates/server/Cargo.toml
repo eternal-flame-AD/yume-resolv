@@ -37,6 +37,7 @@ recursor = ["dep:hickory-recursor", "dep:hickory-resolver"]
 resolver = ["dep:hickory-resolver"]
 sqlite = ["rusqlite"]
 blocklist = ["resolver", "dep:siphasher"]
+blocklist-psl = ["blocklist", "__psl"]
 toml = ["dep:toml"]
 
 tls-aws-lc-rs = [
@@ -87,6 +88,7 @@ h3-ring = [
     "__h3",
 ]
 
+__psl = ["dep:psl", "hickory-proto/__psl"]
 __tls = ["dep:rustls", "dep:tokio-rustls"]
 __https = ["dep:h2", "dep:http", "__tls"]
 __quic = ["__tls"]
@@ -119,6 +121,7 @@ h3-quinn = { workspace = true, optional = true }
 http = { workspace = true, optional = true }
 ipnet = { workspace = true, features = ["serde", "std"] }
 prefix-trie.workspace = true
+psl = { workspace = true, optional = true }
 rusqlite = { workspace = true, features = ["bundled", "time"], optional = true }
 rustls = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }

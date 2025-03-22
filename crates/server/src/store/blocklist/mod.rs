@@ -37,6 +37,10 @@ pub struct BlocklistConfig {
     /// asterisks will be expanded to match queries.
     pub wildcard_match: bool,
 
+    /// Support PSL suffix stripped rules?  Defaults to true. If set to true, block list entries
+    /// containing a `.*` suffix will be matched by stripping off public suffixes.
+    pub psl_match: bool,
+
     /// Minimum wildcard depth.  Defaults to 2.  Any wildcard entries without at least this many
     /// static elements will not be expanded (e.g., *.com has a depth of 1; *.example.com has a
     /// depth of two.) This is meant as a safeguard against an errant block list entry, such as *
@@ -75,6 +79,7 @@ impl Default for BlocklistConfig {
     fn default() -> Self {
         Self {
             wildcard_match: true,
+            psl_match: true,
             min_wildcard_depth: 2,
             lists: vec![],
             sinkhole_ipv4: None,

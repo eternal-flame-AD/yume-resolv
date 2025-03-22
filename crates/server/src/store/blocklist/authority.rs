@@ -7,7 +7,7 @@
 
 use siphasher::sip128::{Hash128, Hasher128};
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     fs::File,
     hash::{BuildHasher, Hash, Hasher},
     io::{self, Error, Read},
@@ -66,9 +66,24 @@ impl Hash for Hash128Output {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HashSubtype {
+    Root,
+    OU,
+    PSL,
+}
+
 impl Hash128Output {
-    fn add_wildcard_offset(self) -> Self {
-        Self(self.0, self.1.wrapping_add(1))
+    fn set_subtype(mut self, subtype: HashSubtype, wildcard: bool) -> Self {
+        if wildcard {
+            self.0 = self.0.wrapping_add(0b1);
+        }
+        match subtype {
+            HashSubtype::Root => (),
+            HashSubtype::OU => self.0 = self.0.wrapping_add(0b010),
+            HashSubtype::PSL => self.0 = self.0.wrapping_add(0b100),
+        }
+        self
     }
 }
 
@@ -130,8 +145,9 @@ impl BuildHasher for NoHashState {
 pub struct BlocklistAuthority {
     sip_base: BlockListHasher,
     origin: LowerName,
-    blocklist: HashSet<Hash128Output, NoHashState>,
+    blocked: HashMap<Hash128Output, bool, NoHashState>,
     wildcard_match: bool,
+    psl_match: bool,
     min_wildcard_depth: u8,
     sinkhole_ipv4: Ipv4Addr,
     sinkhole_ipv6: Ipv6Addr,
@@ -160,8 +176,9 @@ impl BlocklistAuthority {
         let mut authority = Self {
             sip_base: hasher,
             origin: origin.into(),
-            blocklist: HashSet::with_hasher(NoHashState),
+            blocked: HashMap::with_hasher(NoHashState),
             wildcard_match: config.wildcard_match,
+            psl_match: config.psl_match,
             min_wildcard_depth: config.min_wildcard_depth,
             sinkhole_ipv4: match config.sinkhole_ipv4 {
                 Some(ip) => ip,
@@ -208,7 +225,10 @@ impl BlocklistAuthority {
         Ok(authority)
     }
 
-    fn segment_hashes<'a>(&self, name: &'a LowerName) -> impl Iterator<Item = Hash128Output> + 'a {
+    fn segment_hashes_rev<'a, I: Iterator<Item = &'a [u8]> + 'a>(
+        &self,
+        rev_labels: I,
+    ) -> impl Iterator<Item = Hash128Output> + 'a {
         struct PreventClone<T>(T);
         impl<T> Deref for PreventClone<T> {
             type Target = T;
@@ -224,11 +244,15 @@ impl BlocklistAuthority {
         }
         let mut hasher = PreventClone(self.sip_base.clone());
 
-        name.iter().rev().map(move |s| {
+        rev_labels.map(move |s| {
             hasher.write(s);
             let res = hasher.finish128().into();
             res
         })
+    }
+
+    fn segment_hashes<'a>(&self, name: &'a LowerName) -> impl Iterator<Item = Hash128Output> + 'a {
+        self.segment_hashes_rev(name.iter().rev())
     }
 
     fn final_segment_hash(&self, name: &LowerName) -> Hash128Output {
@@ -335,6 +359,39 @@ impl BlocklistAuthority {
                 str_entry += ".";
             }
 
+            let is_whitelist = match str_entry.strip_prefix("!") {
+                Some(trimmed) => {
+                    str_entry = trimmed.to_string();
+                    true
+                }
+                _ => false,
+            };
+
+            let is_ou = match str_entry.strip_suffix(".*.*.") {
+                Some(_) if !self.psl_match => {
+                    warn!("psl match is disabled, skipping blocklist entry {str_entry}");
+                    continue;
+                }
+                Some(trimmed) => {
+                    str_entry = trimmed.to_string();
+                    true
+                }
+                _ => false,
+            };
+
+            let is_psl = is_ou
+                || match str_entry.strip_suffix(".*.") {
+                    Some(_) if !self.psl_match => {
+                        warn!("psl match is disabled, skipping blocklist entry {str_entry}");
+                        continue;
+                    }
+                    Some(trimmed) => {
+                        str_entry = trimmed.to_string();
+                        true
+                    }
+                    _ => false,
+                };
+
             let is_wildcard = match str_entry.strip_prefix("*.") {
                 Some(_) if !self.wildcard_match => {
                     warn!("wildcard match is disabled, skipping blocklist entry {str_entry}");
@@ -358,6 +415,14 @@ impl BlocklistAuthority {
 
             let hash = self.final_segment_hash(&name);
 
+            let subtype = if is_ou {
+                HashSubtype::OU
+            } else if is_psl {
+                HashSubtype::PSL
+            } else {
+                HashSubtype::Root
+            };
+
             if is_wildcard {
                 let depth = name.iter().count();
                 if depth < self.min_wildcard_depth as usize {
@@ -367,9 +432,11 @@ impl BlocklistAuthority {
                     continue;
                 }
 
-                self.blocklist.insert(hash.add_wildcard_offset());
+                self.blocked
+                    .insert(hash.set_subtype(subtype, true), !is_whitelist);
             } else {
-                self.blocklist.insert(hash);
+                self.blocked
+                    .insert(hash.set_subtype(subtype, false), !is_whitelist);
             }
         }
 
@@ -379,23 +446,54 @@ impl BlocklistAuthority {
     /// Perform a blocklist lookup. Returns true on match, false on no match.  This is also where
     /// wildcard expansion is done, if wildcard support is enabled for the blocklist authority.
     fn is_blocked(&self, name: &LowerName) -> bool {
+        macro_rules! check {
+            ($hash:expr, $subtype:expr, $wildcard:expr) => {
+                if let Some(disposition) = self.blocked.get(&$hash.set_subtype($subtype, $wildcard))
+                {
+                    return *disposition;
+                }
+            };
+        }
+
         if !self.wildcard_match {
-            return self.blocklist.contains(&self.final_segment_hash(&name));
+            check!(self.final_segment_hash(&name), HashSubtype::Root, false);
+
+            return false;
         }
 
         let mut last_hash = None;
         for hash in self.segment_hashes(&name) {
             if let Some(last_hash) = last_hash.replace(hash) {
-                if self.blocklist.contains(&last_hash.add_wildcard_offset()) {
-                    return true;
+                check!(last_hash, HashSubtype::Root, true);
+            }
+        }
+
+        if let Some(last_hash) = last_hash {
+            check!(last_hash, HashSubtype::Root, false);
+
+            #[cfg(feature = "blocklist-psl")]
+            {
+                let mut last_hash = None;
+                for hash in self.segment_hashes_rev(name.iter_rev_skip_psl()) {
+                    if let Some(last_hash) = last_hash.replace(hash) {
+                        check!(last_hash, HashSubtype::PSL, true);
+                    }
+                }
+                if let Some(last_hash) = last_hash {
+                    check!(last_hash, HashSubtype::PSL, false);
+                }
+                last_hash = None;
+                for hash in self.segment_hashes_rev(name.iter_rev_skip_psl().skip(1)) {
+                    if let Some(last_hash) = last_hash.replace(hash) {
+                        check!(last_hash, HashSubtype::OU, true);
+                    }
+                }
+                if let Some(last_hash) = last_hash {
+                    check!(last_hash, HashSubtype::OU, false);
                 }
             }
         }
-        if let Some(last_hash) = last_hash {
-            self.blocklist.contains(&last_hash)
-        } else {
-            false
-        }
+        false
     }
 
     /// Generate a BlocklistLookup to return on a blocklist match.  This will return a lookup with
@@ -590,6 +688,7 @@ mod test {
         let config = super::BlocklistConfig {
             wildcard_match: true,
             min_wildcard_depth: 2,
+            psl_match: true,
             lists: vec!["default/blocklist.txt".to_string()],
             sinkhole_ipv4: None,
             sinkhole_ipv6: None,
@@ -652,6 +751,7 @@ mod test {
         subscribe();
         let config = super::BlocklistConfig {
             min_wildcard_depth: 2,
+            psl_match: true,
             wildcard_match: false,
             lists: vec!["default/blocklist.txt".to_string()],
             sinkhole_ipv4: Some(Ipv4Addr::new(192, 0, 2, 1)),
@@ -699,12 +799,97 @@ mod test {
     }
 
     #[tokio::test]
+    #[cfg(feature = "blocklist-psl")]
+    async fn test_blocklist_extended_syntax() {
+        subscribe();
+        let config = super::BlocklistConfig {
+            min_wildcard_depth: 1,
+            wildcard_match: true,
+            psl_match: true,
+            lists: vec!["default/blocklist_extended.txt".to_string()],
+            sinkhole_ipv4: Some(Ipv4Addr::new(192, 0, 2, 1)),
+            sinkhole_ipv6: Some(Ipv6Addr::new(0, 0, 0, 0, 0xc0, 0, 2, 1)),
+            block_message: Some(String::from("blocked")),
+            ttl: 86_400,
+            consult_action: BlocklistConsultAction::Disabled,
+        };
+
+        let blocklist = super::BlocklistAuthority::try_from_config(
+            Name::root(),
+            ZoneType::External,
+            &config,
+            Some(Path::new("../../tests/test-data/test_configs/")),
+        );
+
+        let authority = blocklist.await;
+
+        // Test: verify the blocklist authority was successfully created.
+        match authority {
+            Ok(ref _authority) => {}
+            Err(e) => {
+                error!("Unable to create blocklist authority: {e}");
+                return;
+            }
+        }
+
+        let ao = Arc::new(authority.unwrap()) as Arc<dyn AuthorityObject>;
+
+        let sinkhole_v4 = A::new(192, 0, 2, 1);
+        let msg = config.block_message;
+
+        basic_test(
+            &ao,
+            "wpad.co.uk.",
+            RecordType::A,
+            TestResult::Break,
+            Some(sinkhole_v4),
+            None,
+            msg.clone(),
+        )
+        .await;
+
+        basic_test(
+            &ao,
+            "badsubdomain.foo.com.",
+            RecordType::A,
+            TestResult::Break,
+            Some(sinkhole_v4),
+            None,
+            msg.clone(),
+        )
+        .await;
+
+        basic_test(
+            &ao,
+            "ingest.foo.com.",
+            RecordType::A,
+            TestResult::Break,
+            Some(sinkhole_v4),
+            None,
+            msg.clone(),
+        )
+        .await;
+
+        basic_test(
+            &ao,
+            "test.ingest.foo.com.",
+            RecordType::A,
+            TestResult::Break,
+            Some(sinkhole_v4),
+            None,
+            msg.clone(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
     #[should_panic]
     async fn test_blocklist_wrong_block_message() {
         subscribe();
         let config = super::BlocklistConfig {
             min_wildcard_depth: 2,
             wildcard_match: false,
+            psl_match: true,
             lists: vec!["default/blocklist.txt".to_string()],
             sinkhole_ipv4: Some(Ipv4Addr::new(192, 0, 2, 1)),
             sinkhole_ipv6: Some(Ipv6Addr::new(0, 0, 0, 0, 0xc0, 0, 2, 1)),

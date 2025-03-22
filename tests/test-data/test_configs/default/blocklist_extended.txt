@@ -1,0 +1,5 @@
+wpad.*
+badsubdomain.*.*
+ingest.*.*
+*.ingest.*.*
+!ingest.good.co.uk

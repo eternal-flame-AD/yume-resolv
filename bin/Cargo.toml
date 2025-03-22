@@ -33,6 +33,7 @@ default = ["sqlite", "resolver", "rustls-platform-verifier", "ascii-art"]
 ascii-art = []
 
 blocklist = ["hickory-server/blocklist"]
+blocklist-psl = ["blocklist", "hickory-server/blocklist-psl"]
 recursor = ["hickory-server/recursor"]
 # Recursive Resolution is Experimental!
 resolver = ["hickory-server/resolver"]

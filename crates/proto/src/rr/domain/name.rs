@@ -153,6 +153,21 @@ impl Name {
         }
     }
 
+    #[cfg(feature = "__psl")]
+    /// Returns an iterator over the labels of the name, skipping the public suffix labels.
+    ///
+    pub fn iter_rev_skip_psl(&self) -> impl Iterator<Item = &[u8]> + '_ {
+        use psl::Psl;
+
+        let info = ::psl::List.find(self.iter().rev());
+
+        let mut remaining = info.len + 1; // plus no dot for the first label
+        self.iter().rev().filter(move |label| {
+            remaining = remaining.saturating_sub(label.len());
+            remaining == 0
+        })
+    }
+
     /// Appends the label to the end of this name
     ///
     /// # Example
@@ -2594,6 +2609,17 @@ mod tests {
         assert!(fqdn_name.eq_ignore_root(&relative_name));
         assert!(!fqdn_name.eq_ignore_root_case(&upper_relative_name));
         assert!(fqdn_name.eq_ignore_root(&upper_relative_name));
+    }
+
+    #[test]
+    #[cfg(feature = "__psl")]
+    fn test_iter_rev_skip_psl() {
+        let name = Name::from_utf8("www.example.com").unwrap();
+        let labels = name.iter_rev_skip_psl().collect::<Vec<_>>();
+        assert_eq!(labels, vec![b"example".as_slice(), b"www".as_slice()]);
+        let name = Name::from_utf8("www.example.co.uk").unwrap();
+        let labels = name.iter_rev_skip_psl().collect::<Vec<_>>();
+        assert_eq!(labels, vec![b"example".as_slice(), b"www".as_slice()]);
     }
 
     #[test]
