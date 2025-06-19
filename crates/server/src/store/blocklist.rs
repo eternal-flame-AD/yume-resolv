@@ -568,6 +568,7 @@ impl Authority for BlocklistAuthority {
         trace!("blocklist lookup: {name} {rtype}");
 
         if self.is_blocked(name) {
+            info!("blocklist lookup: {name} {rtype} matched blocklist");
             return Break(Ok(self.blocklist_response(Name::from(name), rtype)));
         }
 
