@@ -22,38 +22,37 @@
 //!    --tls-port=PORT         Override the listening port for TLS connections
 //! ```
 
-// BINARY WARNINGS
-#![warn(
-    clippy::dbg_macro,
-    clippy::unimplemented,
-    missing_copy_implementations,
-    missing_docs,
-    non_snake_case,
-    non_upper_case_globals,
-    rust_2018_idioms,
-    unreachable_pub
-)]
 #![recursion_limit = "128"]
-#![allow(clippy::redundant_clone)]
 
+#[cfg(feature = "metrics")]
+use std::time::Duration;
 use std::{
-    env, fmt,
+    fmt,
     io::Error,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
 };
 
 use clap::Parser;
+#[cfg(feature = "metrics")]
+use metrics::{Counter, Unit, counter, describe_counter, describe_gauge, gauge};
+#[cfg(feature = "metrics")]
+use metrics_process::Collector;
 use socket2::{Domain, Socket, Type};
 use time::OffsetDateTime;
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
+#[cfg(feature = "metrics")]
+use tokio::time::sleep;
 use tokio::{
     net::{TcpListener, UdpSocket},
     runtime,
 };
-use tracing::{Event, Subscriber, error, info, warn};
+#[cfg(any(feature = "__tls", feature = "__https", feature = "__quic"))]
+use tracing::warn;
+use tracing::{Event, Level, Subscriber, error, info};
 use tracing_subscriber::{
+    EnvFilter,
     fmt::{FmtContext, FormatEvent, FormatFields, FormattedFields, format},
     layer::SubscriberExt,
     registry::LookupSpan,
@@ -61,8 +60,14 @@ use tracing_subscriber::{
 };
 
 use hickory_dns::Config;
+#[cfg(all(feature = "metrics", feature = "resolver"))]
+use hickory_dns::ExternalStoreConfig;
+#[cfg(feature = "prometheus-metrics")]
+use hickory_dns::PrometheusServer;
 #[cfg(feature = "__tls")]
 use hickory_dns::TlsCertConfig;
+#[cfg(feature = "metrics")]
+use hickory_dns::{ServerStoreConfig, ServerZoneConfig, ZoneConfig, ZoneTypeConfig};
 use hickory_server::{authority::Catalog, server::ServerFuture};
 
 /// Cli struct for all options managed with clap derive api.
@@ -71,19 +76,19 @@ use hickory_server::{authority::Catalog, server::ServerFuture};
 struct Cli {
     /// Test validation of configuration files
     #[clap(long = "validate")]
-    pub(crate) validate: bool,
+    validate: bool,
 
     /// Number of runtime workers, defaults to the number of CPU cores
     #[clap(long = "workers")]
-    pub(crate) workers: Option<usize>,
+    workers: Option<usize>,
 
     /// Disable INFO messages, WARN and ERROR will remain
     #[clap(short = 'q', long = "quiet", conflicts_with = "debug")]
-    pub(crate) quiet: bool,
+    quiet: bool,
 
     /// Turn on `DEBUG` messages (default is only `INFO`)
     #[clap(short = 'd', long = "debug", conflicts_with = "quiet")]
-    pub(crate) debug: bool,
+    debug: bool,
 
     /// Path to configuration file of named server
     #[clap(
@@ -93,63 +98,79 @@ struct Cli {
         value_name = "NAME",
         value_hint=clap::ValueHint::FilePath,
     )]
-    pub(crate) config: PathBuf,
+    config: PathBuf,
 
     /// Path to the root directory for all zone files,
     /// see also config toml
     #[clap(short = 'z', long = "zonedir", value_name = "DIR", value_hint=clap::ValueHint::DirPath)]
-    pub(crate) zonedir: Option<PathBuf>,
+    zonedir: Option<PathBuf>,
 
     /// Listening port for DNS queries,
     /// overrides any value in config file
     #[clap(short = 'p', long = "port", value_name = "PORT")]
-    pub(crate) port: Option<u16>,
+    port: Option<u16>,
 
     /// Listening port for DNS over TLS queries,
     /// overrides any value in config file
     #[cfg(feature = "__tls")]
     #[clap(long = "tls-port", value_name = "TLS-PORT")]
-    pub(crate) tls_port: Option<u16>,
+    tls_port: Option<u16>,
 
     /// Listening port for DNS over HTTPS queries,
     /// overrides any value in config file
     #[cfg(feature = "__https")]
     #[clap(long = "https-port", value_name = "HTTPS-PORT")]
-    pub(crate) https_port: Option<u16>,
+    https_port: Option<u16>,
 
     /// Listening port for DNS over QUIC queries,
     /// overrides any value in config file
     #[cfg(feature = "__quic")]
     #[clap(long = "quic-port", value_name = "QUIC-PORT")]
-    pub(crate) quic_port: Option<u16>,
+    quic_port: Option<u16>,
+
+    /// Listening socket for Prometheus metrics,
+    /// for remote access configure socket as needed (e.g. 0.0.0.0:9000)
+    /// overrides any value in config file
+    #[cfg(feature = "prometheus-metrics")]
+    #[clap(
+        long = "prometheus-listen-address",
+        value_name = "PROMETHEUS-LISTEN-ADDRESS"
+    )]
+    prometheus_listen_addr: Option<SocketAddr>,
 
     /// Disable TCP protocol,
     /// overrides any value in config file
     #[clap(long = "disable-tcp")]
-    pub(crate) disable_tcp: bool,
+    disable_tcp: bool,
 
     /// Disable UDP protocol,
     /// overrides any value in config file
     #[clap(long = "disable-udp")]
-    pub(crate) disable_udp: bool,
+    disable_udp: bool,
 
     /// Disable TLS protocol,
     /// overrides any value in config file
     #[cfg(feature = "__tls")]
     #[clap(long = "disable-tls", conflicts_with = "tls_port")]
-    pub(crate) disable_tls: bool,
+    disable_tls: bool,
 
     /// Disable HTTPS protocol,
     /// overrides any value in config file
     #[cfg(feature = "__https")]
     #[clap(long = "disable-https", conflicts_with = "https_port")]
-    pub(crate) disable_https: bool,
+    disable_https: bool,
 
     /// Disable QUIC protocol,
     /// overrides any value in config file
     #[cfg(feature = "__quic")]
     #[clap(long = "disable-quic", conflicts_with = "quic_port")]
-    pub(crate) disable_quic: bool,
+    disable_quic: bool,
+
+    /// Disable Prometheus metrics,
+    /// overrides any value in config file
+    #[cfg(feature = "prometheus-metrics")]
+    #[clap(long = "disable-prometheus", conflicts_with = "prometheus_listen_addr")]
+    disable_prometheus: bool,
 }
 
 /// Main method for running the named server.
@@ -166,17 +187,42 @@ fn main() -> Result<(), String> {
 
 fn run() -> Result<(), String> {
     let args = Cli::parse();
+
     // TODO: this should be set after loading config, but it's necessary for initial log lines, no?
-    if args.quiet {
-        quiet()?;
-    } else if args.debug {
-        debug()?;
-    } else {
-        default()?;
-    }
+    let level = match (args.quiet, args.debug) {
+        (true, _) => Level::ERROR,
+        (_, true) => Level::DEBUG,
+        _ => Level::INFO,
+    };
+
+    // Setup tracing for logging based on input
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().event_format(TdnsFormatter))
+        .with(
+            EnvFilter::builder()
+                .with_default_directive(level.into())
+                .from_env()
+                .map_err(|err| {
+                    format!("failed to parse environment variable for tracing: {err}")
+                })?,
+        )
+        .init();
 
     info!("Hickory DNS {} starting...", hickory_client::version());
 
+    let mut runtime = runtime::Builder::new_multi_thread();
+    runtime.enable_all().thread_name("hickory-server-runtime");
+    if let Some(workers) = args.workers {
+        runtime.worker_threads(workers);
+    }
+    let runtime = runtime
+        .build()
+        .map_err(|err| format!("failed to initialize Tokio runtime: {err}"))?;
+
+    runtime.block_on(async_run(args))
+}
+
+async fn async_run(args: Cli) -> Result<(), String> {
     // Load configuration files
 
     let config = args.config.clone();
@@ -193,16 +239,45 @@ fn run() -> Result<(), String> {
         .map(PathBuf::from)
         .unwrap_or(directory_config);
 
-    let mut runtime = runtime::Builder::new_multi_thread();
-    runtime.enable_all().thread_name("hickory-server-runtime");
-    if let Some(workers) = args.workers {
-        runtime.worker_threads(workers);
-    }
-    let runtime = runtime
-        .build()
-        .map_err(|err| format!("failed to initialize Tokio runtime: {err}"))?;
+    #[cfg(feature = "prometheus-metrics")]
+    let prometheus_server_opt = if !args.disable_prometheus && !config.disable_prometheus() {
+        let socket_addr = args
+            .prometheus_listen_addr
+            .unwrap_or(config.prometheus_listen_addr());
+        let listener = build_tcp_listener(socket_addr.ip(), socket_addr.port()).map_err(|err| {
+            format!("failed to bind to Prometheus TCP socket address {socket_addr:?}: {err}")
+        })?;
+        let local_addr = listener
+            .local_addr()
+            .map_err(|err| format!("failed to look up local address: {err}"))?;
 
-    let _guard = runtime.enter();
+        // Set up Prometheus HTTP server.
+        let server = PrometheusServer::new(listener)?;
+        info!("listening for Prometheus metrics on {local_addr:?}");
+        Some(server)
+    } else {
+        info!("Prometheus metrics are disabled");
+        None
+    };
+
+    #[cfg(feature = "metrics")]
+    let (process_metrics_collector, config_metrics) = {
+        // setup process metrics (cpu, memory, ...) collection
+        let collector = Collector::default();
+        collector.describe(); // add metric descriptions
+
+        let process_metrics_collector = tokio::spawn(async move {
+            loop {
+                sleep(Duration::from_secs(1)).await;
+                collector.collect();
+            }
+        });
+
+        // metrics need to be created after the recorder is registered
+        // calling increment() after registration is not sufficient
+        let config_metrics = ConfigMetrics::new(&config);
+        (process_metrics_collector, config_metrics)
+    };
 
     #[cfg(unix)]
     let mut signal = signal(SignalKind::terminate())
@@ -215,10 +290,13 @@ fn run() -> Result<(), String> {
             .zone()
             .map_err(|err| format!("failed to read zone name from {config_path:?}: {err}"))?;
 
-        match runtime.block_on(zone.load(&zone_dir)) {
+        match zone.load(&zone_dir).await {
             Ok(authority) => catalog.upsert(zone_name.into(), authority),
             Err(err) => return Err(format!("could not load zone {zone_name}: {err}")),
         }
+
+        #[cfg(feature = "metrics")]
+        config_metrics.increment_zone_metrics(zone);
     }
 
     let v4addr = config
@@ -301,7 +379,7 @@ fn run() -> Result<(), String> {
         if !args.disable_tls && !config.disable_tls() {
             // setup TLS listeners
             config_tls(
-                &args,
+                args.tls_port,
                 &mut server,
                 &config,
                 tls_cert_config,
@@ -316,7 +394,7 @@ fn run() -> Result<(), String> {
         if !args.disable_https && !config.disable_https() {
             // setup HTTPS listeners
             config_https(
-                &args,
+                args.https_port,
                 &mut server,
                 &config,
                 tls_cert_config,
@@ -331,7 +409,7 @@ fn run() -> Result<(), String> {
         if !args.disable_quic && !config.disable_quic() {
             // setup QUIC listeners
             config_quic(
-                &args,
+                args.quic_port,
                 &mut server,
                 &config,
                 tls_cert_config,
@@ -373,7 +451,7 @@ fn run() -> Result<(), String> {
     // Ideally the processing would be n-threads for receiving, which hand off to m-threads for
     //  request handling. It would generally be the case that n <= m.
     info!("server starting up, awaiting connections...");
-    match runtime.block_on(server.block_until_done()) {
+    match server.block_until_done().await {
         Ok(()) => {
             // we're exiting for some reason...
             info!("Hickory DNS {} stopping", hickory_client::version());
@@ -390,19 +468,28 @@ fn run() -> Result<(), String> {
         }
     };
 
+    // Shut down the Prometheus metrics server after the DNS server has gracefully shut down.
+    #[cfg(feature = "prometheus-metrics")]
+    if let Some(server) = prometheus_server_opt {
+        server.stop().await;
+    }
+
+    #[cfg(feature = "metrics")]
+    process_metrics_collector.abort();
+
     Ok(())
 }
 
 #[cfg(feature = "__tls")]
 fn config_tls(
-    args: &Cli,
+    tls_port: Option<u16>,
     server: &mut ServerFuture<Catalog>,
     config: &Config,
     tls_cert_config: &TlsCertConfig,
     zone_dir: &Path,
     listen_addrs: &[IpAddr],
 ) -> Result<(), String> {
-    let tls_listen_port: u16 = args.tls_port.unwrap_or_else(|| config.tls_listen_port());
+    let tls_listen_port = tls_port.unwrap_or_else(|| config.tls_listen_port());
 
     if listen_addrs.is_empty() {
         warn!("a tls certificate was specified, but no TLS addresses configured to listen on");
@@ -438,16 +525,14 @@ fn config_tls(
 
 #[cfg(feature = "__https")]
 fn config_https(
-    args: &Cli,
+    https_port: Option<u16>,
     server: &mut ServerFuture<Catalog>,
     config: &Config,
     tls_cert_config: &TlsCertConfig,
     zone_dir: &Path,
     listen_addrs: &[IpAddr],
 ) -> Result<(), String> {
-    let https_listen_port: u16 = args
-        .https_port
-        .unwrap_or_else(|| config.https_listen_port());
+    let https_listen_port = https_port.unwrap_or_else(|| config.https_listen_port());
     let endpoint_path = config.http_endpoint();
 
     if listen_addrs.is_empty() {
@@ -495,14 +580,14 @@ fn config_https(
 
 #[cfg(feature = "__quic")]
 fn config_quic(
-    args: &Cli,
+    quic_port: Option<u16>,
     server: &mut ServerFuture<Catalog>,
     config: &Config,
     tls_cert_config: &TlsCertConfig,
     zone_dir: &Path,
     listen_addrs: &[IpAddr],
 ) -> Result<(), String> {
-    let quic_listen_port: u16 = args.quic_port.unwrap_or_else(|| config.quic_listen_port());
+    let quic_listen_port = quic_port.unwrap_or_else(|| config.quic_listen_port());
 
     if listen_addrs.is_empty() {
         warn!("a tls certificate was specified, but no QUIC addresses configured to listen on");
@@ -614,49 +699,113 @@ where
     }
 }
 
-fn get_env() -> String {
-    env::var("RUST_LOG").unwrap_or_default()
+#[cfg(feature = "metrics")]
+struct ConfigMetrics {
+    #[cfg(feature = "resolver")]
+    zones_forwarder: Counter,
+
+    zones_file_primary: Counter,
+    zones_file_secondary: Counter,
+    #[cfg(feature = "sqlite")]
+    zones_sqlite_primary: Counter,
+    #[cfg(feature = "sqlite")]
+    zones_sqlite_secondary: Counter,
 }
 
-fn all_hickory_dns(level: impl ToString) -> String {
-    format!(
-        "hickory_={level},{env}",
-        level = level.to_string().to_lowercase(),
-        env = get_env()
-    )
-}
+#[cfg(feature = "metrics")]
+impl ConfigMetrics {
+    fn new(config: &Config) -> Self {
+        let hickory_info = gauge!("hickory_info", "version" => hickory_client::version());
+        describe_gauge!("hickory_info", Unit::Count, "hickory service metadata");
+        hickory_info.set(1);
 
-/// appends hickory-server debug to RUST_LOG
-pub fn debug() -> Result<(), String> {
-    logger(tracing::Level::DEBUG)
-}
+        let hickory_config_info = gauge!("hickory_config_info",
+            "directory" => config.directory().to_string_lossy().to_string(),
+            "disable_https" => config.disable_https().to_string(),
+            "disable_quic" => config.disable_quic().to_string(),
+            "disable_tcp" => config.disable_tcp().to_string(),
+            "disable_tls" => config.disable_tls().to_string(),
+            "disable_udp" => config.disable_udp().to_string(),
+            "allow_networks" => config.allow_networks().len().to_string(),
+            "deny_networks" => config.deny_networks().len().to_string(),
+            "zones" => config.zones().len().to_string()
+        );
+        describe_gauge!(
+            "hickory_config_info",
+            Unit::Count,
+            "hickory config metadata"
+        );
+        hickory_config_info.set(1);
 
-/// appends hickory-server info to RUST_LOG
-pub fn default() -> Result<(), String> {
-    logger(tracing::Level::INFO)
-}
+        let zones_total_name = "hickory_zones_total";
+        let zones_file_primary = counter!(zones_total_name, "store" => "file", "role" => "primary");
+        let zones_file_secondary =
+            counter!(zones_total_name, "store" => "file", "role" => "secondary");
 
-/// appends hickory-server error to RUST_LOG
-pub fn quiet() -> Result<(), String> {
-    logger(tracing::Level::ERROR)
-}
+        describe_counter!(
+            zones_total_name,
+            Unit::Count,
+            "number of dns zones in storages"
+        );
 
-// TODO: add dep on util crate, share logging config...
-fn logger(level: tracing::Level) -> Result<(), String> {
-    // Setup tracing for logging based on input
-    let filter = tracing_subscriber::EnvFilter::builder()
-        .with_default_directive(tracing::Level::WARN.into())
-        .parse(all_hickory_dns(level))
-        .map_err(|err| format!("failed to configure tracing/logging: {err}"))?;
+        #[cfg(feature = "resolver")]
+        let zones_forwarder = counter!(zones_total_name, "store" => "forwarder");
 
-    let formatter = tracing_subscriber::fmt::layer().event_format(TdnsFormatter);
+        #[cfg(feature = "sqlite")]
+        let (zones_sqlite_primary, zones_sqlite_secondary) = {
+            let zones_primary_sqlite =
+                counter!(zones_total_name, "store" => "sqlite", "role" => "primary");
+            let zones_secondary_sqlite =
+                counter!(zones_total_name, "store" => "sqlite", "role" => "secondary");
+            (zones_primary_sqlite, zones_secondary_sqlite)
+        };
 
-    tracing_subscriber::registry()
-        .with(formatter)
-        .with(filter)
-        .init();
+        Self {
+            #[cfg(feature = "resolver")]
+            zones_forwarder,
+            #[cfg(feature = "sqlite")]
+            zones_sqlite_primary,
+            zones_file_primary,
+            #[cfg(feature = "sqlite")]
+            zones_sqlite_secondary,
+            zones_file_secondary,
+        }
+    }
 
-    Ok(())
+    fn increment_zone_metrics(&self, zone: &ZoneConfig) {
+        match &zone.zone_type_config {
+            ZoneTypeConfig::Primary(server_config) => self.increment_stores(server_config, true),
+            ZoneTypeConfig::Secondary(server_config) => self.increment_stores(server_config, false),
+            ZoneTypeConfig::External { stores } => {
+                for store in stores {
+                    #[cfg(feature = "resolver")]
+                    if let ExternalStoreConfig::Forward(_) = store {
+                        self.zones_forwarder.increment(1)
+                    }
+                }
+            }
+        }
+    }
+
+    fn increment_stores(&self, server_config: &ServerZoneConfig, primary: bool) {
+        for store in &server_config.stores {
+            if matches!(store, ServerStoreConfig::File(_)) {
+                if primary {
+                    self.zones_file_primary.increment(1)
+                } else {
+                    self.zones_file_secondary.increment(1)
+                }
+            }
+            #[cfg(feature = "sqlite")]
+            if matches!(store, ServerStoreConfig::Sqlite(_)) {
+                if primary {
+                    self.zones_sqlite_primary.increment(1)
+                } else {
+                    self.zones_sqlite_secondary.increment(1)
+                }
+            };
+        }
+    }
 }
 
 /// Build a TcpListener for a given IP, port pair; IPv6 listeners will not accept v4 connections

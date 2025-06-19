@@ -7,8 +7,13 @@
 
 use std::{io, net::SocketAddr};
 
-use hickory_proto::rr::Record;
-use tracing::{debug, trace};
+use hickory_proto::{
+    ProtoError,
+    op::{Header, ResponseCode},
+    rr::Record,
+    serialize::binary::BinEncodable,
+};
+use tracing::{debug, error, trace};
 
 use crate::{
     authority::MessageResponse,
@@ -26,7 +31,7 @@ pub trait ResponseHandler: Clone + Send + Sync + Unpin + 'static {
     // TODO: add associated error type
     //type Error;
 
-    /// Serializes and sends a message to to the wrapped handle
+    /// Serializes and sends a message to the wrapped handle
     ///
     /// self is consumed as only one message should ever be sent in response to a Request
     async fn send_response<'a>(
@@ -104,10 +109,11 @@ impl ResponseHandler for ResponseHandle {
             impl Iterator<Item = &'a Record> + Send + 'a,
         >,
     ) -> io::Result<ResponseInfo> {
+        let id = response.header().id();
         debug!(
-            "response: {} response_code: {}",
-            response.header().id(),
-            response.header().response_code(),
+            id,
+            response_code = %response.header().response_code(),
+            "sending response",
         );
         let mut buffer = Vec::with_capacity(512);
         let encode_result = {
@@ -124,8 +130,9 @@ impl ResponseHandler for ResponseHandle {
             response.destructive_emit(&mut encoder)
         };
 
-        let info = encode_result.map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("error encoding message: {e}"))
+        let info = encode_result.or_else(|error| {
+            error!(%error, "error encoding message");
+            encode_fallback_servfail_response(id, &mut buffer)
         })?;
 
         self.stream_handle
@@ -134,4 +141,21 @@ impl ResponseHandler for ResponseHandle {
 
         Ok(info)
     }
+}
+
+/// Clears the buffer, encodes a SERVFAIL response in it, and returns a matching
+/// ResponseInfo.
+pub(crate) fn encode_fallback_servfail_response(
+    id: u16,
+    buffer: &mut Vec<u8>,
+) -> Result<ResponseInfo, ProtoError> {
+    buffer.clear();
+    let mut encoder = BinEncoder::new(buffer);
+    encoder.set_max_size(512);
+    let mut header = Header::new();
+    header.set_id(id);
+    header.set_response_code(ResponseCode::ServFail);
+    header.emit(&mut encoder)?;
+
+    Ok(ResponseInfo::serve_failed())
 }

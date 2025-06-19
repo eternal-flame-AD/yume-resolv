@@ -7,22 +7,22 @@
 
 use std::{io, net::SocketAddr, sync::Arc};
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use futures_util::lock::Mutex;
 use h2::server;
 use hickory_proto::{http::Version, rr::Record};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::{
     access::AccessControl,
     authority::MessageResponse,
-    proto::h2::h2_server,
-    proto::xfer::Protocol,
+    proto::{h2::h2_server, xfer::Protocol},
     server::{
-        ResponseInfo, request_handler::RequestHandler, response_handler::ResponseHandler,
-        server_future,
+        ResponseInfo,
+        request_handler::RequestHandler,
+        response_handler::{ResponseHandler, encode_fallback_servfail_response},
     },
 };
 
@@ -78,34 +78,20 @@ pub(crate) async fn h2_handler<T, I>(
         let responder = HttpsResponseHandle(Arc::new(Mutex::new(respond)));
 
         tokio::spawn(async move {
-            match h2_server::message_from(dns_hostname, http_endpoint, request).await {
-                Ok(bytes) => handle_request(bytes, src_addr, access, handler, responder).await,
-                Err(err) => warn!("error while handling request from {}: {}", src_addr, err),
+            let body = match h2_server::message_from(dns_hostname, http_endpoint, request).await {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    warn!("error while handling request from {}: {}", src_addr, err);
+                    return;
+                }
             };
+
+            super::handle_request(&body, src_addr, Protocol::Https, access, handler, responder)
+                .await
         });
 
         // we'll continue handling requests from here.
     }
-}
-
-async fn handle_request<T>(
-    bytes: BytesMut,
-    src_addr: SocketAddr,
-    access: Arc<AccessControl>,
-    handler: Arc<T>,
-    responder: HttpsResponseHandle,
-) where
-    T: RequestHandler,
-{
-    server_future::handle_request(
-        &bytes,
-        src_addr,
-        Protocol::Https,
-        access,
-        handler,
-        responder,
-    )
-    .await
 }
 
 #[derive(Clone)]
@@ -128,11 +114,15 @@ impl ResponseHandler for HttpsResponseHandle {
         use crate::proto::http::response;
         use crate::proto::serialize::binary::BinEncoder;
 
+        let id = response.header().id();
         let mut bytes = Vec::with_capacity(512);
         // mut block
         let info = {
             let mut encoder = BinEncoder::new(&mut bytes);
-            response.destructive_emit(&mut encoder)?
+            response.destructive_emit(&mut encoder).or_else(|error| {
+                error!(%error, "error encoding message");
+                encode_fallback_servfail_response(id, &mut bytes)
+            })?
         };
         let bytes = Bytes::from(bytes);
         let response = response::new(Version::Http2, bytes.len())?;

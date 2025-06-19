@@ -1,20 +1,23 @@
-// Copyright 2015-2021 Benjamin Fry <benjaminfry@me.com>
+// Copyright 2015-2019 Benjamin Fry <benjaminfry@me.com>
 //
 // Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
 // https://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
 // https://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
+#![cfg(feature = "resolver")]
+
+//! Forwarding resolver related types
+
 use std::io;
 #[cfg(feature = "__dnssec")]
 use std::sync::Arc;
 
-use hickory_resolver::{
-    config::{ResolveHosts, ResolverOpts},
-    name_server::{ConnectionProvider, TokioConnectionProvider},
-};
+use serde::Deserialize;
 use tracing::{debug, info};
 
+#[cfg(feature = "metrics")]
+use crate::store::metrics::QueryStoreMetrics;
 #[cfg(feature = "__dnssec")]
 use crate::{authority::Nsec3QueryInfo, dnssec::NxProofKind, proto::dnssec::TrustAnchors};
 use crate::{
@@ -26,9 +29,13 @@ use crate::{
         op::ResponseCode,
         rr::{LowerName, Name, Record, RecordType},
     },
-    resolver::{Resolver, config::ResolverConfig, lookup::Lookup as ResolverLookup},
+    resolver::{
+        Resolver,
+        config::{NameServerConfigGroup, ResolveHosts, ResolverConfig, ResolverOpts},
+        lookup::Lookup as ResolverLookup,
+        name_server::{ConnectionProvider, TokioConnectionProvider},
+    },
     server::RequestInfo,
-    store::forwarder::ForwardConfig,
 };
 
 /// A builder to construct a [`ForwardAuthority`].
@@ -148,6 +155,8 @@ impl<P: ConnectionProvider> ForwardAuthorityBuilder<P> {
         Ok(ForwardAuthority {
             origin: origin.into(),
             resolver,
+            #[cfg(feature = "metrics")]
+            metrics: QueryStoreMetrics::new("forwarder"),
         })
     }
 }
@@ -158,6 +167,8 @@ impl<P: ConnectionProvider> ForwardAuthorityBuilder<P> {
 pub struct ForwardAuthority<P: ConnectionProvider = TokioConnectionProvider> {
     origin: LowerName,
     resolver: Resolver<P>,
+    #[cfg(feature = "metrics")]
+    metrics: QueryStoreMetrics,
 }
 
 impl<P: ConnectionProvider> ForwardAuthority<P> {
@@ -251,10 +262,15 @@ impl<P: ConnectionProvider> Authority for ForwardAuthority<P> {
         name.set_fqdn(false);
 
         use LookupControlFlow::*;
-        match self.resolver.lookup(name, rtype).await {
+        let lookup = match self.resolver.lookup(name, rtype).await {
             Ok(lookup) => Continue(Ok(ForwardLookup(lookup))),
             Err(e) => Continue(Err(LookupError::from(e))),
-        }
+        };
+
+        #[cfg(feature = "metrics")]
+        self.metrics.increment_lookup(&lookup);
+
+        lookup
     }
 
     async fn search(
@@ -316,4 +332,14 @@ impl LookupObject for ForwardLookup {
     fn take_additionals(&mut self) -> Option<Box<dyn LookupObject>> {
         None
     }
+}
+
+/// Configuration for file based zones
+#[derive(Clone, Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct ForwardConfig {
+    /// upstream name_server configurations
+    pub name_servers: NameServerConfigGroup,
+    /// Resolver options
+    pub options: Option<ResolverOpts>,
 }

@@ -1,11 +1,11 @@
-// Copyright 2015-2021 Benjamin Fry <benjaminfry@me.com>
+// Copyright 2015-2019 Benjamin Fry <benjaminfry@me.com>
 //
 // Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
 // https://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
 // https://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
-//! File-backed authority
+//! Zone file based serving with Dynamic DNS and journaling support
 
 use std::{
     collections::BTreeMap,
@@ -14,8 +14,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use serde::Deserialize;
 use tracing::{debug, info};
 
+#[cfg(feature = "metrics")]
+use crate::store::metrics::StoreMetrics;
 use crate::{
     authority::{
         Authority, LookupControlFlow, LookupOptions, MessageRequest, UpdateResult, ZoneType,
@@ -23,7 +26,7 @@ use crate::{
     proto::rr::{LowerName, Name, RecordSet, RecordType, RrKey},
     proto::serialize::txt::Parser,
     server::RequestInfo,
-    store::{file::FileConfig, in_memory::InMemoryAuthority},
+    store::in_memory::InMemoryAuthority,
 };
 #[cfg(feature = "__dnssec")]
 use crate::{
@@ -36,7 +39,11 @@ use crate::{
 ///
 /// Authorities default to DNSClass IN. The ZoneType specifies if this should be treated as the
 /// start of authority for the zone, is a Secondary, or a cached zone.
-pub struct FileAuthority(InMemoryAuthority);
+pub struct FileAuthority {
+    in_memory: InMemoryAuthority,
+    #[cfg(feature = "metrics")]
+    metrics: StoreMetrics,
+}
 
 impl FileAuthority {
     /// Creates a new Authority.
@@ -44,7 +51,7 @@ impl FileAuthority {
     /// # Arguments
     ///
     /// * `origin` - The zone `Name` being created, this should match that of the `RecordType::SOA`
-    ///              record.
+    ///   record.
     /// * `records` - The map of the initial set of records in the zone.
     /// * `zone_type` - The type of zone, i.e. is this authoritative?
     /// * `allow_axfr` - Whether AXFR is allowed.
@@ -60,15 +67,22 @@ impl FileAuthority {
         allow_axfr: bool,
         #[cfg(feature = "__dnssec")] nx_proof_kind: Option<NxProofKind>,
     ) -> Result<Self, String> {
-        InMemoryAuthority::new(
-            origin,
-            records,
-            zone_type,
-            allow_axfr,
-            #[cfg(feature = "__dnssec")]
-            nx_proof_kind,
-        )
-        .map(Self)
+        Ok(Self {
+            #[cfg(feature = "metrics")]
+            metrics: {
+                let new = StoreMetrics::new("file");
+                new.persistent.zone_records.increment(records.len() as f64);
+                new
+            },
+            in_memory: InMemoryAuthority::new(
+                origin,
+                records,
+                zone_type,
+                allow_axfr,
+                #[cfg(feature = "__dnssec")]
+                nx_proof_kind,
+            )?,
+        })
     }
 
     /// Read the Authority for the origin from the specified configuration
@@ -79,6 +93,29 @@ impl FileAuthority {
         root_dir: Option<&Path>,
         config: &FileConfig,
         #[cfg(feature = "__dnssec")] nx_proof_kind: Option<NxProofKind>,
+    ) -> Result<Self, String> {
+        Self::try_from_config_internal(
+            origin,
+            zone_type,
+            allow_axfr,
+            root_dir,
+            config,
+            #[cfg(feature = "__dnssec")]
+            nx_proof_kind,
+            #[cfg(feature = "metrics")]
+            false,
+        )
+    }
+
+    // internal load for e.g. sqlite db creation
+    pub(crate) fn try_from_config_internal(
+        origin: Name,
+        zone_type: ZoneType,
+        allow_axfr: bool,
+        root_dir: Option<&Path>,
+        config: &FileConfig,
+        #[cfg(feature = "__dnssec")] nx_proof_kind: Option<NxProofKind>,
+        #[cfg(feature = "metrics")] is_internal_load: bool,
     ) -> Result<Self, String> {
         let root_dir_path = root_dir.map(PathBuf::from).unwrap_or_default();
         let zone_path = root_dir_path.join(&config.zone_file_path);
@@ -112,19 +149,29 @@ impl FileAuthority {
         );
         debug!("zone: {:#?}", records);
 
-        Self::new(
-            origin,
-            records,
-            zone_type,
-            allow_axfr,
-            #[cfg(feature = "__dnssec")]
-            nx_proof_kind,
-        )
+        Ok(Self {
+            #[cfg(feature = "metrics")]
+            metrics: {
+                let new = StoreMetrics::new("file");
+                if !is_internal_load {
+                    new.persistent.zone_records.increment(records.len() as f64);
+                }
+                new
+            },
+            in_memory: InMemoryAuthority::new(
+                origin,
+                records,
+                zone_type,
+                allow_axfr,
+                #[cfg(feature = "__dnssec")]
+                nx_proof_kind,
+            )?,
+        })
     }
 
     /// Unwrap the InMemoryAuthority
     pub fn unwrap(self) -> InMemoryAuthority {
-        self.0
+        self.in_memory
     }
 }
 
@@ -132,13 +179,13 @@ impl Deref for FileAuthority {
     type Target = InMemoryAuthority;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.in_memory
     }
 }
 
 impl DerefMut for FileAuthority {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        &mut self.in_memory
     }
 }
 
@@ -148,12 +195,12 @@ impl Authority for FileAuthority {
 
     /// What type is this zone
     fn zone_type(&self) -> ZoneType {
-        self.0.zone_type()
+        self.in_memory.zone_type()
     }
 
     /// Return true if AXFR is allowed
     fn is_axfr_allowed(&self) -> bool {
-        self.0.is_axfr_allowed()
+        self.in_memory.is_axfr_allowed()
     }
 
     /// Perform a dynamic update of a zone
@@ -164,7 +211,7 @@ impl Authority for FileAuthority {
 
     /// Get the origin of this zone, i.e. example.com is the origin for www.example.com
     fn origin(&self) -> &LowerName {
-        self.0.origin()
+        self.in_memory.origin()
     }
 
     /// Looks up all Resource Records matching the given `Name` and `RecordType`.
@@ -173,11 +220,11 @@ impl Authority for FileAuthority {
     ///
     /// * `name` - The name to look up.
     /// * `rtype` - The `RecordType` to look up. `RecordType::ANY` will return all records matching
-    ///             `name`. `RecordType::AXFR` will return all record types except `RecordType::SOA`
-    ///             due to the requirements that on zone transfers the `RecordType::SOA` must both
-    ///             precede and follow all other records.
+    ///   `name`. `RecordType::AXFR` will return all record types except `RecordType::SOA`
+    ///   due to the requirements that on zone transfers the `RecordType::SOA` must both
+    ///   precede and follow all other records.
     /// * `lookup_options` - Query-related lookup options (e.g., DNSSEC DO bit, supported hash
-    ///                      algorithms, etc.)
+    ///   algorithms, etc.)
     ///
     /// # Return value
     ///
@@ -188,7 +235,12 @@ impl Authority for FileAuthority {
         rtype: RecordType,
         lookup_options: LookupOptions,
     ) -> LookupControlFlow<Self::Lookup> {
-        self.0.lookup(name, rtype, lookup_options).await
+        let lookup = self.in_memory.lookup(name, rtype, lookup_options).await;
+
+        #[cfg(feature = "metrics")]
+        self.metrics.query.increment_lookup(&lookup);
+
+        lookup
     }
 
     /// Using the specified query, perform a lookup against this zone.
@@ -197,7 +249,7 @@ impl Authority for FileAuthority {
     ///
     /// * `request_info` - the query to perform the lookup with.
     /// * `lookup_options` - Query-related lookup options (e.g., DNSSEC DO bit, supported hash
-    ///                      algorithms, etc.)
+    ///   algorithms, etc.)
     ///
     /// # Return value
     ///
@@ -207,12 +259,17 @@ impl Authority for FileAuthority {
         request_info: RequestInfo<'_>,
         lookup_options: LookupOptions,
     ) -> LookupControlFlow<Self::Lookup> {
-        self.0.search(request_info, lookup_options).await
+        let search = self.in_memory.search(request_info, lookup_options).await;
+
+        #[cfg(feature = "metrics")]
+        self.metrics.query.increment_lookup(&search);
+
+        search
     }
 
     /// Get the NS, NameServer, record for the zone
     async fn ns(&self, lookup_options: LookupOptions) -> LookupControlFlow<Self::Lookup> {
-        self.0.ns(lookup_options).await
+        self.in_memory.ns(lookup_options).await
     }
 
     /// Return the NSEC records based on the given name
@@ -220,15 +277,15 @@ impl Authority for FileAuthority {
     /// # Arguments
     ///
     /// * `name` - given this name (i.e. the lookup name), return the NSEC record that is less than
-    ///            this
+    ///   this
     /// * `lookup_options` - Query-related lookup options (e.g., DNSSEC DO bit, supported hash
-    ///                      algorithms, etc.)
+    ///   algorithms, etc.)
     async fn get_nsec_records(
         &self,
         name: &LowerName,
         lookup_options: LookupOptions,
     ) -> LookupControlFlow<Self::Lookup> {
-        self.0.get_nsec_records(name, lookup_options).await
+        self.in_memory.get_nsec_records(name, lookup_options).await
     }
 
     #[cfg(feature = "__dnssec")]
@@ -237,7 +294,7 @@ impl Authority for FileAuthority {
         info: Nsec3QueryInfo<'_>,
         lookup_options: LookupOptions,
     ) -> LookupControlFlow<Self::Lookup> {
-        self.0.get_nsec3_records(info, lookup_options).await
+        self.in_memory.get_nsec3_records(info, lookup_options).await
     }
 
     /// Returns the SOA of the authority.
@@ -245,17 +302,17 @@ impl Authority for FileAuthority {
     /// *Note*: This will only return the SOA, if this is fulfilling a request, a standard lookup
     ///  should be used, see `soa_secure()`, which will optionally return RRSIGs.
     async fn soa(&self) -> LookupControlFlow<Self::Lookup> {
-        self.0.soa().await
+        self.in_memory.soa().await
     }
 
     /// Returns the SOA record for the zone
     async fn soa_secure(&self, lookup_options: LookupOptions) -> LookupControlFlow<Self::Lookup> {
-        self.0.soa_secure(lookup_options).await
+        self.in_memory.soa_secure(lookup_options).await
     }
 
     #[cfg(feature = "__dnssec")]
     fn nx_proof_kind(&self) -> Option<&NxProofKind> {
-        self.0.nx_proof_kind()
+        self.in_memory.nx_proof_kind()
     }
 }
 
@@ -264,18 +321,26 @@ impl Authority for FileAuthority {
 impl DnssecAuthority for FileAuthority {
     /// Add a (Sig0) key that is authorized to perform updates against this authority
     async fn add_update_auth_key(&self, name: Name, key: KEY) -> DnsSecResult<()> {
-        self.0.add_update_auth_key(name, key).await
+        self.in_memory.add_update_auth_key(name, key).await
     }
 
     /// Add Signer
     async fn add_zone_signing_key(&self, signer: SigSigner) -> DnsSecResult<()> {
-        self.0.add_zone_signing_key(signer).await
+        self.in_memory.add_zone_signing_key(signer).await
     }
 
     /// Sign the zone for DNSSEC
     async fn secure_zone(&self) -> DnsSecResult<()> {
-        DnssecAuthority::secure_zone(&self.0).await
+        DnssecAuthority::secure_zone(&self.in_memory).await
     }
+}
+
+/// Configuration for file based zones
+#[derive(Deserialize, PartialEq, Eq, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct FileConfig {
+    /// path to the zone file
+    pub zone_file_path: PathBuf,
 }
 
 #[cfg(test)]

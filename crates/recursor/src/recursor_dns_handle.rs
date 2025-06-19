@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::IpAddr,
     sync::{
         Arc,
@@ -21,8 +21,14 @@ use crate::{
     proto::{
         ForwardNSData, ProtoErrorKind,
         op::Query,
-        rr::{RData, RData::CNAME, RecordType, rdata::NS},
+        rr::{
+            RData,
+            RData::CNAME,
+            Record, RecordType,
+            rdata::{A, AAAA, NS},
+        },
         runtime::TokioRuntimeProvider,
+        xfer::DnsResponse,
     },
     recursor_pool::RecursorPool,
     resolver::{
@@ -206,6 +212,9 @@ impl RecursorDnsHandle {
             .await
         {
             Ok((depth, ns)) => (depth, ns),
+            // Handle the short circuit case for when we receive NXDOMAIN on a parent name, per RFC
+            // 8020.
+            Err(e) if e.is_nx_domain() => return Err(e),
             Err(e) => return Err(Error::from(format!("no nameserver found for {zone}: {e}"))),
         };
 
@@ -215,10 +224,10 @@ impl RecursorDnsHandle {
             .lookup(query.clone(), ns, request_time, query_has_dnssec_ok)
             .await
         {
-            Ok(response) => {
+            Ok((lookup, _)) => {
                 let response = self
                     .resolve_cnames(
-                        response,
+                        lookup,
                         query.clone(),
                         request_time,
                         query_has_dnssec_ok,
@@ -257,10 +266,10 @@ impl RecursorDnsHandle {
                             .lookup(query.clone(), ns, request_time, query_has_dnssec_ok)
                             .await
                         {
-                            Ok(response) => {
+                            Ok((lookup, _)) => {
                                 let response = self
                                     .resolve_cnames(
-                                        response,
+                                        lookup,
                                         query.clone(),
                                         request_time,
                                         query_has_dnssec_ok,
@@ -374,7 +383,7 @@ impl RecursorDnsHandle {
         ns: RecursorPool<TokioRuntimeProvider>,
         now: Instant,
         expect_dnssec_in_cached_response: bool,
-    ) -> Result<Lookup, Error> {
+    ) -> Result<(Lookup, Option<DnsResponse>), Error> {
         if let Some(lookup) = self.record_cache.get(&query, now) {
             let lookup = lookup?;
 
@@ -391,7 +400,7 @@ impl RecursorDnsHandle {
                 // fall through to send query to child zone
             } else {
                 debug!("cached data {lookup:?}");
-                return Ok(lookup);
+                return Ok((lookup, None));
             }
         }
 
@@ -401,7 +410,10 @@ impl RecursorDnsHandle {
         // TODO: should we change DnsHandle to always be a single response? And build a totally custom handler for other situations?
         // TODO: check if data is "authentic"
         match response.await {
-            Ok(r) => super::cache_response(r, Some(ns.zone()), &self.record_cache, query, now),
+            Ok(r) => Ok((
+                super::cache_response(r.clone(), Some(ns.zone()), &self.record_cache, query, now)?,
+                Some(r),
+            )),
             Err(e) => {
                 warn!("lookup error: {e}");
                 Err(Error::from(e))
@@ -429,7 +441,7 @@ impl RecursorDnsHandle {
 
         let parent_zone = zone.base_name();
 
-        let (mut ns_depth, mut nameserver_pool) = if parent_zone.is_root() {
+        let (mut ns_depth, nameserver_pool) = if parent_zone.is_root() {
             debug!("using roots for {zone} nameservers");
             (depth, self.roots.clone())
         } else {
@@ -437,98 +449,87 @@ impl RecursorDnsHandle {
                 .await?
         };
 
-        let mut lookup = Query::query(zone.clone(), RecordType::NS);
+        let query = Query::query(zone.clone(), RecordType::NS);
 
-        // Query for nameserver records via the pool for the parent zone, following SOA referrals up
-        // to the nameserver recursion limit.
-        let response = loop {
-            ns_depth += 1;
+        ns_depth += 1;
+        Error::recursion_exceeded(self.ns_recursion_limit, ns_depth, &zone)?;
 
-            Error::recursion_exceeded(self.ns_recursion_limit, ns_depth, &zone)?;
-
-            let error = match self
-                .lookup(lookup.clone(), nameserver_pool.clone(), request_time, false)
-                .await
-            {
-                Ok(response) => break response,
-                Err(e) => e,
-            };
-
-            if let ErrorKind::Forward(name) = error.kind() {
-                // if we already had this name, don't try again
-                if zone == name.name {
-                    debug!("zone previously searched for {}", name.name);
-                    return Err(error);
-                };
-
-                debug!("ns for {zone} forwarded to {} via SOA record", name.name);
-
-                (ns_depth, nameserver_pool) = self
-                    .ns_pool_for_zone(name.name.clone(), request_time, ns_depth)
-                    .await?;
-
-                lookup = Query::query(name.name.clone(), RecordType::NS);
-                continue;
-            }
-
-            return Err(error);
+        // Query for nameserver records via the pool for the parent zone.
+        let lookup_res = self
+            .lookup(query, nameserver_pool.clone(), request_time, false)
+            .await;
+        let (lookup, response_opt) = match lookup_res {
+            Ok((lookup, response_opt)) => (lookup, response_opt),
+            // Short-circuit on NXDOMAIN, per RFC 8020.
+            Err(e) if e.is_nx_domain() => return Err(e),
+            // Short-circuit on timeouts. Requesting a longer name from the same pool would likely
+            // encounter them again.
+            Err(e) if e.is_timeout() => return Err(e),
+            // The name `zone` is not a zone cut. Return the same pool of name servers again, but do
+            // not cache it. If this was recursively called by `ns_pool_for_zone()`, the outer call
+            // will try again with one more label added to the iterative query name.
+            Err(_) => return Ok((depth, nameserver_pool)),
         };
+
+        let any_ns = lookup
+            .record_iter()
+            .any(|record| record.record_type() == RecordType::NS);
+        if !any_ns {
+            // Not a zone cut, but there is a CNAME or other record at this name. Return the
+            // same pool of name servers as above in the error case, to try again with a
+            // longer name.
+            return Ok((depth, nameserver_pool));
+        }
 
         // TODO: grab TTL and use for cache
         // get all the NS records and glue
         let mut config_group = NameServerConfigGroup::new();
         let mut need_ips_for_names = Vec::new();
+        let mut glue_ips = HashMap::new();
 
-        // unpack all glued records
-        for zns in response.record_iter() {
+        if let Some(response) = response_opt {
+            for section in [
+                response.answers(),
+                response.name_servers(),
+                response.additionals(),
+            ] {
+                self.add_glue_to_map(&mut glue_ips, section.iter());
+            }
+        }
+
+        for zns in lookup.record_iter() {
             let Some(ns_data) = zns.data().as_ns() else {
                 debug!("response is not NS: {:?}; skipping", zns.data());
                 continue;
             };
 
-            if !super::is_subzone(&lookup.name().base_name(), zns.name()) {
+            if !super::is_subzone(&zone.base_name(), zns.name()) {
                 warn!(
                     "dropping out of bailiwick record for {:?} with parent {:?}",
                     zns.name(),
-                    lookup.name().base_name(),
+                    zone.base_name(),
                 );
                 continue;
             }
 
-            let cached_a = self.record_cache.get(
-                &Query::query(ns_data.0.clone(), RecordType::A),
-                request_time,
-            );
-            let cached_aaaa = self.record_cache.get(
-                &Query::query(ns_data.0.clone(), RecordType::AAAA),
-                request_time,
-            );
-
-            let cached_a = cached_a.and_then(Result::ok).map(Lookup::into_iter);
-            let cached_aaaa = cached_aaaa.and_then(Result::ok).map(Lookup::into_iter);
-
-            let mut glue_ips = cached_a
-                .into_iter()
-                .flatten()
-                .chain(cached_aaaa.into_iter().flatten())
-                .filter_map(|r| {
-                    let ip = r.ip_addr()?;
-
-                    if self.matches_nameserver_filter(ip) {
-                        debug!(name = %ns_data, %ip, "ignoring address due to do_not_query");
-                        None
-                    } else {
-                        Some(ip)
-                    }
-                })
-                .peekable();
-
-            if glue_ips.peek().is_none() {
-                debug!("glue not found for {ns_data}");
-                need_ips_for_names.push(ns_data.to_owned());
+            for record_type in [RecordType::A, RecordType::AAAA] {
+                if let Some(Ok(lookup)) = self
+                    .record_cache
+                    .get(&Query::query(ns_data.0.clone(), record_type), request_time)
+                {
+                    self.add_glue_to_map(&mut glue_ips, lookup.records().iter());
+                }
             }
 
-            config_group.append_ips(glue_ips, true);
+            match glue_ips.get(&ns_data.0) {
+                Some(glue) if !glue.is_empty() => {
+                    config_group.append_ips(glue.iter().cloned(), true)
+                }
+                _ => {
+                    debug!("glue not found for {ns_data}");
+                    need_ips_for_names.push(ns_data.to_owned());
+                }
+            }
         }
 
         // If we have no glue, collect missing nameserver IP addresses.
@@ -562,6 +563,30 @@ impl RecursorDnsHandle {
         debug!("found nameservers for {zone}");
         self.name_server_cache.lock().insert(zone, ns.clone());
         Ok((depth, ns))
+    }
+
+    /// Helper function to add IP addresses from any A or AAAA records to a map indexed by record
+    /// name.
+    fn add_glue_to_map<'a>(
+        &self,
+        glue_map: &mut HashMap<Name, Vec<IpAddr>>,
+        records: impl Iterator<Item = &'a Record>,
+    ) {
+        for record in records {
+            let ip = match record.data() {
+                RData::A(A(ipv4)) => (*ipv4).into(),
+                RData::AAAA(AAAA(ipv6)) => (*ipv6).into(),
+                _ => continue,
+            };
+            if self.matches_nameserver_filter(ip) {
+                debug!(name = %record.name(), %ip, "ignoring address due to do_not_query");
+                continue;
+            }
+            let ns_glue_ips = glue_map.entry(record.name().clone()).or_default();
+            if !ns_glue_ips.contains(&ip) {
+                ns_glue_ips.push(ip);
+            }
+        }
     }
 
     /// Build an NS Pool based on an NS-record referral.

@@ -12,14 +12,15 @@ use futures_util::lock::Mutex;
 use h3::server::RequestStream;
 use h3_quinn::BidiStream;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::{
     access::AccessControl,
     authority::MessageResponse,
     server::{
-        ResponseInfo, request_handler::RequestHandler, response_handler::ResponseHandler,
-        server_future,
+        ResponseInfo,
+        request_handler::RequestHandler,
+        response_handler::{ResponseHandler, encode_fallback_servfail_response},
     },
 };
 use hickory_proto::{
@@ -81,9 +82,10 @@ where
         let stream = Arc::new(Mutex::new(stream));
         let responder = H3ResponseHandle(stream.clone());
 
-        tokio::spawn(handle_request(
-            request, src_addr, access, handler, responder,
-        ));
+        tokio::spawn(async move {
+            super::handle_request(&request, src_addr, Protocol::H3, access, handler, responder)
+                .await
+        });
 
         max_requests -= 1;
         if max_requests == 0 {
@@ -95,18 +97,6 @@ where
     }
 
     Ok(())
-}
-
-async fn handle_request<T>(
-    bytes: Bytes,
-    src_addr: SocketAddr,
-    access: Arc<AccessControl>,
-    handler: Arc<T>,
-    responder: H3ResponseHandle,
-) where
-    T: RequestHandler,
-{
-    server_future::handle_request(&bytes, src_addr, Protocol::H3, access, handler, responder).await
 }
 
 #[derive(Clone)]
@@ -128,11 +118,15 @@ impl ResponseHandler for H3ResponseHandle {
         use crate::proto::http::response;
         use crate::proto::serialize::binary::BinEncoder;
 
+        let id = response.header().id();
         let mut bytes = Vec::with_capacity(512);
         // mut block
         let info = {
             let mut encoder = BinEncoder::new(&mut bytes);
-            response.destructive_emit(&mut encoder)?
+            response.destructive_emit(&mut encoder).or_else(|error| {
+                error!(%error, "error encoding message");
+                encode_fallback_servfail_response(id, &mut bytes)
+            })?
         };
         let bytes = Bytes::from(bytes);
         let response = response::new(Version::Http3, bytes.len())?;

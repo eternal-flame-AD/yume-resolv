@@ -10,6 +10,7 @@ use core::marker::PhantomData;
 use alloc::vec::Vec;
 
 use crate::{
+    ProtoError,
     error::{ProtoErrorKind, ProtoResult},
     op::Header,
 };
@@ -370,14 +371,16 @@ impl<'a> BinEncoder<'a> {
         let mut count = 0;
         for i in iter {
             let rollback = self.set_rollback();
-            i.emit(self).map_err(|e| {
-                if let ProtoErrorKind::MaxBufferSizeExceeded(_) = e.kind() {
-                    rollback.rollback(self);
-                    return ProtoErrorKind::NotAllRecordsWritten { count }.into();
-                } else {
-                    return e;
-                }
-            })?;
+            if let Err(e) = i.emit(self) {
+                return Err(match e.kind() {
+                    ProtoErrorKind::MaxBufferSizeExceeded(_) => {
+                        rollback.rollback(self);
+                        ProtoError::from(ProtoErrorKind::NotAllRecordsWritten { count })
+                    }
+                    _ => e,
+                });
+            }
+
             count += 1;
         }
         Ok(count)
@@ -430,7 +433,8 @@ impl<'a> BinEncoder<'a> {
 
     fn set_rollback(&self) -> Rollback {
         Rollback {
-            rollback_index: self.offset(),
+            offset: self.offset(),
+            pointers: self.name_pointers.len(),
         }
     }
 }
@@ -474,12 +478,15 @@ impl<T: EncodedSize> Place<T> {
 
 /// A type representing a rollback point in a stream
 pub(crate) struct Rollback {
-    rollback_index: usize,
+    offset: usize,
+    pointers: usize,
 }
 
 impl Rollback {
     pub(crate) fn rollback(self, encoder: &mut BinEncoder<'_>) {
-        encoder.set_offset(self.rollback_index)
+        let Self { offset, pointers } = self;
+        encoder.set_offset(offset);
+        encoder.name_pointers.truncate(pointers);
     }
 }
 

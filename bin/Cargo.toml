@@ -38,6 +38,8 @@ recursor = ["hickory-server/recursor"]
 # Recursive Resolution is Experimental!
 resolver = ["hickory-server/resolver"]
 sqlite = ["hickory-server/sqlite", "dep:rusqlite"]
+prometheus-metrics = ["metrics", "dep:http", "dep:hyper", "dep:hyper-util", "dep:metrics-exporter-prometheus", "dep:tokio-util"]
+metrics = ["hickory-server/metrics", "dep:metrics", "dep:metrics-process"]
 
 tls-aws-lc-rs = ["hickory-server/tls-aws-lc-rs", "__tls"]
 https-aws-lc-rs = ["hickory-server/https-aws-lc-rs", "tls-aws-lc-rs", "__https"]
@@ -73,6 +75,9 @@ path = "src/hickory-dns.rs"
 cfg-if.workspace = true
 clap = { workspace = true, default-features = false, features = ["cargo", "derive", "help", "std", "suggestions"] }
 futures-util = { workspace = true, default-features = false, features = ["std"] }
+http = { workspace = true, optional = true }
+hyper = { workspace = true, features = ["server"], optional = true }
+hyper-util = { workspace = true, features = ["server-auto", "server-graceful", "tokio"], optional = true }
 ipnet = { workspace = true, features = ["serde"] }
 # rusqlite is actually only needed for test situations, but we need an optional dependency
 # here so we can disable it for MSRV tests (rusqlite only supports latest stable)
@@ -85,10 +90,14 @@ time.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "std"] }
 tokio = { workspace = true, features = ["time", "rt", "signal"] }
+tokio-util = { workspace = true, optional = true }
 toml.workspace = true
 hickory-client.workspace = true
 hickory-proto.workspace = true
 hickory-server = { workspace = true, features = ["toml"] }
+metrics = { workspace = true, optional = true }
+metrics-exporter-prometheus = { workspace = true, optional = true }
+metrics-process = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
@@ -101,6 +110,9 @@ hickory-resolver.workspace = true
 test-support.workspace = true
 toml.workspace = true
 webpki-roots.workspace = true
+# metrics tests
+reqwest = { workspace = true, default-features = false }
+prometheus-parse = { workspace = true }
 
 [lints]
 workspace = true

@@ -1,8 +1,10 @@
+use std::{net::Ipv4Addr, time::Duration};
+
 use dns_test::{
     FQDN, Implementation, Network, Resolver, Result,
     client::{Client, DigSettings},
     name_server::{Graph, NameServer, Sign},
-    record::{Record, RecordType},
+    record::{A, Record, RecordType},
     tshark::{Capture, Direction},
     zone_file::SignSettings,
 };
@@ -128,7 +130,15 @@ fn can_validate_ns_query_case_randomization() -> Result<()> {
         &FQDN::TEST_DOMAIN,
     )?;
 
-    tshark.wait_for_capture()?;
+    tshark.wait_until(
+        |captures| {
+            captures.iter().any(|capture| match capture.direction {
+                Direction::Outgoing { destination } => destination == client.ipv4_addr(),
+                _ => false,
+            })
+        },
+        Duration::from_secs(10),
+    )?;
     let captures = tshark.terminate()?;
 
     assert!(output.status.is_noerror());
@@ -216,6 +226,112 @@ fn single_node_dns_graph_with_bind_as_peer() -> Result<()> {
             }
         }
     }
+
+    Ok(())
+}
+
+#[test]
+fn five_secure_zones() -> Result<()> {
+    let network = Network::new()?;
+
+    let subdomain_zone = FQDN::TEST_DOMAIN.push_label("bar");
+    let leaf_zone = subdomain_zone.push_label("foo");
+
+    let mut leaf_ns = NameServer::new(&dns_test::PEER, leaf_zone.clone(), &network)?;
+    leaf_ns.add(A {
+        fqdn: leaf_zone.clone(),
+        ttl: 86400,
+        ipv4_addr: Ipv4Addr::new(1, 2, 3, 4),
+    });
+    let leaf_ns = leaf_ns.sign(SignSettings::default())?;
+
+    let mut subdomain_ns = NameServer::new(&dns_test::PEER, subdomain_zone.clone(), &network)?;
+    subdomain_ns.referral_nameserver(&leaf_ns);
+    subdomain_ns.add(leaf_ns.ds().ksk.clone());
+    let subdomain_ns = subdomain_ns.sign(SignSettings::default())?;
+
+    let mut domain_ns = NameServer::new(&dns_test::PEER, FQDN::TEST_DOMAIN, &network)?;
+    domain_ns.referral_nameserver(&subdomain_ns);
+    domain_ns.add(subdomain_ns.ds().ksk.clone());
+    let domain_ns = domain_ns.sign(SignSettings::default())?;
+
+    let mut tld_ns = NameServer::new(&dns_test::PEER, FQDN::TEST_TLD, &network)?;
+    tld_ns.referral_nameserver(&domain_ns);
+    tld_ns.add(domain_ns.ds().ksk.clone());
+    let tld_ns = tld_ns.sign(SignSettings::default())?;
+
+    let mut root_ns = NameServer::new(&dns_test::PEER, FQDN::ROOT, &network)?;
+    root_ns.referral_nameserver(&tld_ns);
+    root_ns.add(tld_ns.ds().ksk.clone());
+    let root_ns = root_ns.sign(SignSettings::default())?;
+    let root = root_ns.root_hint();
+    let trust_anchor = root_ns.trust_anchor();
+
+    let _root_ns = root_ns.start()?;
+    let _tld_ns = tld_ns.start()?;
+    let _domain_ns = domain_ns.start()?;
+    let _subdomain_ns = subdomain_ns.start()?;
+    let _leaf_ns = leaf_ns.start()?;
+
+    let resolver = Resolver::new(&network, root)
+        .trust_anchor(&trust_anchor)
+        .start()?;
+
+    let client = Client::new(&network)?;
+
+    let output = client.dig(
+        *DigSettings::default().recurse(),
+        resolver.ipv4_addr(),
+        RecordType::A,
+        &leaf_zone,
+    )?;
+
+    assert!(output.status.is_noerror());
+    assert!(!output.answer.is_empty());
+
+    Ok(())
+}
+
+#[test]
+#[ignore = "hickory-recursor reuses a cached glue RRset, which lacks RRSIGs"]
+fn glue_reuse() -> Result<()> {
+    let network = Network::new()?;
+
+    let leaf_ns = NameServer::builder(dns_test::PEER.clone(), FQDN::TEST_DOMAIN, network.clone())
+        .nameserver_fqdn(FQDN::TEST_DOMAIN)
+        .build()?;
+    let leaf_ns = leaf_ns.sign(SignSettings::default())?;
+
+    let mut tld_ns = NameServer::new(&dns_test::PEER, FQDN::TEST_TLD, &network)?;
+    tld_ns.referral_nameserver(&leaf_ns);
+    tld_ns.add(leaf_ns.ds().ksk.clone());
+    let tld_ns = tld_ns.sign(SignSettings::default())?;
+
+    let mut root_ns = NameServer::new(&dns_test::PEER, FQDN::ROOT, &network)?;
+    root_ns.referral_nameserver(&tld_ns);
+    root_ns.add(tld_ns.ds().ksk.clone());
+    let root_ns = root_ns.sign(SignSettings::default())?;
+    let root = root_ns.root_hint();
+    let trust_anchor = root_ns.trust_anchor();
+
+    let _root_ns = root_ns.start()?;
+    let _tld_ns = tld_ns.start()?;
+    let _leaf_ns = leaf_ns.start()?;
+
+    let resolver = Resolver::new(&network, root)
+        .trust_anchor(&trust_anchor)
+        .start()?;
+    let client = Client::new(&network)?;
+
+    let output = client.dig(
+        *DigSettings::default().recurse(),
+        resolver.ipv4_addr(),
+        RecordType::A,
+        &FQDN::TEST_DOMAIN,
+    )?;
+
+    assert!(output.status.is_noerror(), "{:?}", output.status);
+    assert!(!output.answer.is_empty());
 
     Ok(())
 }

@@ -18,8 +18,11 @@ use hickory_client::client::Client;
 use hickory_client::{ClientError, client::ClientHandle, proto::xfer::DnsResponse};
 #[cfg(feature = "__dnssec")]
 use hickory_proto::dnssec::Algorithm;
-use hickory_proto::rr::{DNSClass, Name, RData, RecordType, rdata::A};
 use hickory_proto::xfer::Protocol;
+use hickory_proto::{
+    op::ResponseCode,
+    rr::{DNSClass, Name, RData, RecordType, rdata::A},
+};
 use regex::Regex;
 use tokio::runtime::Runtime;
 use tracing::{info, warn};
@@ -31,12 +34,12 @@ pub struct SocketPort {
 }
 
 #[derive(Debug, Default)]
-pub struct SocketPorts(HashMap<Protocol, SocketPort>);
+pub struct SocketPorts(HashMap<ServerProtocol, SocketPort>);
 
 impl SocketPorts {
     /// This will overwrite the existing value
-    pub fn put(&mut self, protocol: Protocol, addr: SocketAddr) {
-        let entry = self.0.entry(protocol).or_default();
+    pub fn put(&mut self, protocol: impl Into<ServerProtocol>, addr: SocketAddr) {
+        let entry = self.0.entry(protocol.into()).or_default();
 
         if addr.is_ipv4() {
             entry.v4 = addr.port();
@@ -46,20 +49,33 @@ impl SocketPorts {
     }
 
     /// Assumes there is only one V4 addr for the IP based on the usage in the Server
-    pub fn get_v4(&self, protocol: Protocol) -> Option<u16> {
+    pub fn get_v4(&self, protocol: impl Into<ServerProtocol>) -> Option<u16> {
         self.0
-            .get(&protocol)
+            .get(&protocol.into())
             .iter()
             .find_map(|ports| if ports.v4 == 0 { None } else { Some(ports.v4) })
     }
 
     /// Assumes there is only one V4 addr for the IP based on the usage in the Server
     #[allow(unused)]
-    pub fn get_v6(&self, protocol: Protocol) -> Option<u16> {
+    pub fn get_v6(&self, protocol: impl Into<ServerProtocol>) -> Option<u16> {
         self.0
-            .get(&protocol)
+            .get(&protocol.into())
             .iter()
             .find_map(|ports| if ports.v6 == 0 { None } else { Some(ports.v6) })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ServerProtocol {
+    Dns(Protocol),
+    #[cfg(feature = "metrics")]
+    PrometheusMetrics,
+}
+
+impl From<Protocol> for ServerProtocol {
+    fn from(proto: Protocol) -> Self {
+        Self::Dns(proto)
     }
 }
 
@@ -106,6 +122,8 @@ where
     command.arg(format!("--https-port={}", 0));
     #[cfg(feature = "__quic")]
     command.arg(format!("--quic-port={}", 0));
+    #[cfg(feature = "prometheus-metrics")]
+    command.arg(format!("--prometheus-listen-address=127.0.0.1:{}", 0));
 
     println!("named cli options: {command:#?}");
 
@@ -129,8 +147,12 @@ where
                 info!("killing named");
 
                 let mut named = named_killer.lock().unwrap();
-                if let Err(e) = named.kill() {
-                    warn!("warning: failed to kill named: {:?}", e);
+                if let Err(error) = named.kill() {
+                    warn!(?error, "warning: failed to kill named");
+                    return;
+                }
+                if let Err(error) = named.wait() {
+                    warn!(?error, "warning: failed to wait for named");
                 }
             };
 
@@ -159,7 +181,7 @@ where
 
     // Search strings for the ports used during testing
     let addr_regex = Regex::new(
-        r"listening for (UDP|TCP|TLS|HTTPS|QUIC) on ((?:(?:0\.0\.0\.0)|(?:\[::\])):\d+)",
+        r"listening for (UDP|TCP|TLS|HTTPS|QUIC|Prometheus metrics) on ((?:(?:0\.0\.0\.0)|(?:127\.0\.0\.1)|(?:\[::\])):\d+)",
     )
     .unwrap();
 
@@ -193,6 +215,10 @@ where
                 "HTTPS" => socket_ports.put(Protocol::Https, socket_addr),
                 #[cfg(feature = "__quic")]
                 "QUIC" => socket_ports.put(Protocol::Quic, socket_addr),
+                #[cfg(feature = "metrics")]
+                "Prometheus metrics" => {
+                    socket_ports.put(ServerProtocol::PrometheusMetrics, socket_addr)
+                }
                 _ => panic!("unsupported protocol: {proto}"),
             }
         } else if output.contains("awaiting connections...") {
@@ -268,14 +294,9 @@ pub fn query_a<C: ClientHandle>(io_loop: &mut Runtime, client: &mut C) {
 #[allow(dead_code)]
 pub fn query_a_refused<C: ClientHandle>(io_loop: &mut Runtime, client: &mut C) {
     let name = Name::from_str("www.example.com.").unwrap();
-    let error =
-        query_message(io_loop, client, name, RecordType::A).expect_err("Expected an Error here");
+    let response = query_message(io_loop, client, name, RecordType::A).unwrap();
 
-    println!("got error: {error:?}");
-    // assert!(
-    //     matches!(*error.kind(), ClientErrorKind::Timeout),
-    //     "Expected Timeout, got error: {error:?}"
-    // );
+    assert_eq!(response.response_code(), ResponseCode::Refused);
 }
 
 // This only validates that a query to the server works, it shouldn't be used for more than this.
