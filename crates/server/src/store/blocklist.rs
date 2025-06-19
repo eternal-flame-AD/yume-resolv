@@ -8,6 +8,7 @@
 
 #![cfg(feature = "blocklist")]
 
+use hickory_proto::rr::rdata::CNAME;
 use siphasher::sip128::{Hash128, Hasher128};
 
 use serde::Deserialize;
@@ -568,7 +569,7 @@ impl Authority for BlocklistAuthority {
         trace!("blocklist lookup: {name} {rtype}");
 
         if self.is_blocked(name) {
-            info!("blocklist lookup: {name} {rtype} matched blocklist");
+            info!("blocklist lookup: {rtype} {name} matched blocklist");
             return Break(Ok(self.blocklist_response(Name::from(name), rtype)));
         }
 
@@ -597,7 +598,29 @@ impl Authority for BlocklistAuthority {
                 if lookup.is_break() {
                     lookup.map_dyn()
                 } else {
-                    last_result
+                    match last_result {
+                        LookupControlFlow::Continue(Ok(lookup)) => {
+                            for record in lookup.iter() {
+                                let lname = LowerName::from(record.name());
+                                let rt = record.record_type();
+                                let lookup = self.lookup(&lname, rt, lookup_options).await;
+
+                                info!(
+                                    "blocklist consult: {rtype} {name} matched blocklist because returned response includes {rt} {lname}"
+                                );
+
+                                match lookup {
+                                    LookupControlFlow::Break(Ok(mut lookup)) => {
+                                        lookup.add_cname(name.clone().into(), lname.into());
+                                        return LookupControlFlow::Break(Ok(Box::new(lookup)));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            LookupControlFlow::Continue(Ok(lookup))
+                        }
+                        e => e,
+                    }
                 }
             }
         }
@@ -721,6 +744,17 @@ impl Default for BlocklistConfig {
 
 /// A lookup object that is returned when a blocklist entry is matched.
 pub struct BlocklistLookup(Lookup);
+
+impl BlocklistLookup {
+    fn add_cname(&mut self, pointer: Name, pointee: Name) {
+        let rec = Record::from_rdata(
+            pointer,
+            self.0.record_iter().next().map(|r| r.ttl()).unwrap_or(600),
+            RData::CNAME(CNAME(pointee)),
+        );
+        self.0.extend_records(vec![rec]);
+    }
+}
 
 impl LookupObject for BlocklistLookup {
     fn is_empty(&self) -> bool {
