@@ -608,12 +608,11 @@ impl Authority for BlocklistAuthority {
                                 let rt = record.record_type();
                                 let lookup = self.lookup(&lname, rt, lookup_options).await;
 
-                                info!(
-                                    "blocklist consult: {rtype} {name} matched blocklist because returned response includes {rt} {lname}"
-                                );
-
                                 match lookup {
                                     LookupControlFlow::Break(Ok(mut lookup)) => {
+                                        info!(
+                                            "blocklist consult: {rtype} {name} matched blocklist because returned response includes {rt} {lname}"
+                                        );
                                         lookup.add_cname(name.clone().into(), lname.into());
                                         return LookupControlFlow::Break(Ok(Box::new(lookup)));
                                     }
