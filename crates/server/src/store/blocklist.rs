@@ -290,6 +290,9 @@ impl BlocklistAuthority {
     ///   min_wildcard_depth (default: 2) controls how many static name labels must be present for a
     ///   wildcard entry to be valid.  With the default value of 2, an entry for '\*.foo.com' would
     ///   be accepted, but an entry for '\*.com' would not.**
+    /// * Trailing wildcards are supported using the Public Suffix List (PSL) list.  E.g.,
+    ///   'dummy.*' will match any top-level domain called 'dummy' under any public suffix,
+    ///   'dummy.*.*' will match any second-level domain called 'dummy' under any organizational domain,
     /// * All entries are treated as being fully-qualified. If an entry does not contain a trailing
     ///   '.', one will be added before insertion into the cache.
     ///
