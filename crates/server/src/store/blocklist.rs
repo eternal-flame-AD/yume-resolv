@@ -251,6 +251,7 @@ impl BlocklistAuthority {
 
         rev_labels.map(move |s| {
             hasher.write(s);
+            hasher.write_u64(0);
             let res = hasher.finish128().into();
             res
         })
@@ -264,6 +265,7 @@ impl BlocklistAuthority {
         let mut hasher = self.sip_base.clone();
         name.iter().rev().for_each(|s| {
             hasher.write(s);
+            hasher.write_u64(0);
         });
         hasher.finish128().into()
     }
@@ -283,6 +285,7 @@ impl BlocklistAuthority {
     /// # Expected format of blocklist entries
     ///
     /// * One entry per line
+    /// * Any entry starting with '!' will be treated as a whitelist entry and overrides blacklist entries.
     /// * Any character after a '\#' will be treated as a comment and stripped out.
     /// * Leading wildcard entries are supported when the user has wildcard_match set to true.
     ///   E.g., '\*.foo.com' will match any host in the foo.com domain.  Intermediate wildcard
