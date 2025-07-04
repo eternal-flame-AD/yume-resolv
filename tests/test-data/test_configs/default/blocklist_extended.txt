@@ -3,3 +3,5 @@ badsubdomain.*.*
 ingest.*.*
 *.ingest.*.*
 !ingest.good.co.uk
+
+.bad.com

@@ -293,6 +293,7 @@ impl BlocklistAuthority {
     ///   min_wildcard_depth (default: 2) controls how many static name labels must be present for a
     ///   wildcard entry to be valid.  With the default value of 2, an entry for '\*.foo.com' would
     ///   be accepted, but an entry for '\*.com' would not.**
+    /// * '*.example.com', 'example.com' can be shortened to '.example.com'
     /// * Trailing wildcards are supported using the Public Suffix List (PSL) list.  E.g.,
     ///   'dummy.*' will match any top-level domain called 'dummy' under any public suffix,
     ///   'dummy.*.*' will match any second-level domain called 'dummy' under any organizational domain,
@@ -403,17 +404,23 @@ impl BlocklistAuthority {
                     _ => false,
                 };
 
-            let is_wildcard = match str_entry.strip_prefix("*.") {
+            let (is_wildcard, is_self) = match str_entry
+                .strip_prefix("*.")
+                .map(|s| (s, false))
+                .or_else(|| str_entry.strip_prefix(".").map(|s| (s, true)))
+            {
                 Some(_) if !self.wildcard_match => {
                     warn!("wildcard match is disabled, skipping blocklist entry {str_entry}");
                     continue;
                 }
-                Some(trimmed) => {
+                Some((trimmed, include_self)) => {
                     str_entry = trimmed.to_string();
-                    true
+                    (true, include_self)
                 }
-                _ => false,
+                _ => (false, true),
             };
+
+            debug_assert!(is_self || is_wildcard);
 
             trace!("inserting blocklist entry {str_entry} (is_wildcard: {is_wildcard})");
 
@@ -445,7 +452,9 @@ impl BlocklistAuthority {
 
                 self.blocked
                     .insert(hash.set_subtype(subtype, true), !is_whitelist);
-            } else {
+            }
+
+            if is_self {
                 self.blocked
                     .insert(hash.set_subtype(subtype, false), !is_whitelist);
             }
@@ -959,6 +968,28 @@ mod test {
         basic_test(
             &ao,
             "wpad.co.uk.",
+            RecordType::A,
+            TestResult::Break,
+            Some(sinkhole_v4),
+            None,
+            msg.clone(),
+        )
+        .await;
+
+        basic_test(
+            &ao,
+            "bad.com.",
+            RecordType::A,
+            TestResult::Break,
+            Some(sinkhole_v4),
+            None,
+            msg.clone(),
+        )
+        .await;
+
+        basic_test(
+            &ao,
+            "test.bad.com.",
             RecordType::A,
             TestResult::Break,
             Some(sinkhole_v4),
