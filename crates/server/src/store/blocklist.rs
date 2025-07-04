@@ -1000,6 +1000,28 @@ mod test {
 
         basic_test(
             &ao,
+            "telemetry.example.com.",
+            RecordType::A,
+            TestResult::Break,
+            Some(sinkhole_v4),
+            None,
+            msg.clone(),
+        )
+        .await;
+
+        basic_test(
+            &ao,
+            "x.telemetry.example.com.",
+            RecordType::A,
+            TestResult::Break,
+            Some(sinkhole_v4),
+            None,
+            msg.clone(),
+        )
+        .await;
+
+        basic_test(
+            &ao,
             "badsubdomain.foo.com.",
             RecordType::A,
             TestResult::Break,
